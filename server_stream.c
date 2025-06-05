@@ -15,6 +15,12 @@ typedef struct
     uint64_t report_num_packets_lost;
     uint64_t total_num_packets_sent;
     uint64_t total_num_packets_lost;
+    uint64_t total_num_bytes_sent;
+    uint32_t min_rtt;
+    uint32_t srtt;
+    uint32_t cwnd_exiting_slow_start;
+    uint64_t gooput_max_kbps;
+    double   search_undelv_rate_max;
     ev_timer report_timer;
 } server_stream;
 
@@ -28,7 +34,15 @@ static void print_report(server_stream *s)
     s->report_num_packets_lost = stats.num_packets.lost - s->total_num_packets_lost;
     s->total_num_packets_sent = stats.num_packets.sent;
     s->total_num_packets_lost = stats.num_packets.lost;
-    printf("connection %i second %i send window: %"PRIu32" packets sent: %"PRIu64" packets lost: %"PRIu64"\n", s->report_id, s->report_second, stats.cc.cwnd, s->report_num_packets_sent, s->report_num_packets_lost);
+    s->total_num_bytes_sent = stats.num_bytes.sent;
+    s->min_rtt = stats.rtt.minimum;
+    s->srtt = stats.rtt.smoothed;
+    s->cwnd_exiting_slow_start = stats.cc.cwnd_exiting_slow_start;
+    s->gooput_max_kbps = stats.cc.gput_max;
+    s->search_undelv_rate_max = stats.cc.undelv_rate_max;
+    printf("connection %i second %i ss gput mbps: %.2f ss subr: %.3f send wnd: %"PRIu32" srtt ms: %d pkts sent: %"PRIu64" pkts lost: %"PRIu64"\n",
+           s->report_id, s->report_second, s->gooput_max_kbps/1000., s->search_undelv_rate_max, stats.cc.cwnd, s->srtt,
+           s->report_num_packets_sent, s->report_num_packets_lost);
     fflush(stdout);
     ++s->report_second;
 }
@@ -42,7 +56,9 @@ static void server_stream_destroy(quicly_stream_t *stream, quicly_error_t err)
 {
     server_stream *s = (server_stream*)stream->data;
     print_report(s);
-    printf("connection %i total packets sent: %"PRIu64" total packets lost: %"PRIu64"\n", s->report_id, s->total_num_packets_sent, s->total_num_packets_lost);
+    bool ss_exit = s->cwnd_exiting_slow_start ? true : false;
+    printf("connection %i total pkts sent: %"PRIu64" total pkts lost: %"PRIu64" total bytes sent: %ld min rtt ms: %d ss exit: %d\n",
+            s->report_id, s->total_num_packets_sent, s->total_num_packets_lost, s->total_num_bytes_sent, s->min_rtt, ss_exit);
     ev_timer_stop(EV_DEFAULT, &s->report_timer);
     free(s);
 }

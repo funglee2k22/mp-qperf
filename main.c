@@ -12,16 +12,19 @@ static void usage(const char *cmd)
     printf("Usage: %s [options]\n"
             "\n"
             "Options:\n"
-            "  -c target            run as client and connect to target server\n"
-            "  --cc [reno,cubic]    congestion control algorithm to use (default reno)\n"
-            "  -e                   measure time for connection establishment and first byte only\n"
-            "  -g                   enable UDP generic segmentation offload\n"
-            "  --iw initial-window  initial window to use (default 10)\n"
-            "  -l log-file          file to log tls secrets\n"
-            "  -p                   port to listen on/connect to (default 18080)\n"
-            "  -s  address          listen as server on address\n"
-            "  -t time (s)          run for X seconds (default 10s)\n"
-            "  -h                   print this help\n"
+            "  -c target               run as client and connect to target server\n"
+            "  -s                      run as server\n"
+            "  -p port                 port to listen on/connect to (default 18080)\n"
+            "  -B address              bind to the interface associated with the address\n"
+            "  --cc [reno,cubic]       congestion control algorithm to use (default reno)\n"
+            "  -e                      measure time for connection establishment and first byte only\n"
+            "  -g                      enable UDP generic segmentation offload\n"
+            "  --iw initial-window     initial window to use (default 10)\n"
+            "  -l log-file             file to log tls secrets\n"
+            "  -t time (s)             run for X seconds (default 10s)\n"
+            " --qtls [enable,disable]  enable/disable quic tls (default enable)\n"
+            " --opmode [qperf,asbsm]   asbsm terminates on the first slow start exit (default qperf)\n"
+            "  -h                      print this help\n"
             "\n",
            cmd);
 }
@@ -30,8 +33,13 @@ static struct option long_options[] =
 {
     {"cc", required_argument, NULL, 0},
     {"iw", required_argument, NULL, 1},
+    {"qtls", required_argument, NULL, 2},
+    {"opmode", required_argument, NULL, 3},
     {NULL, 0, NULL, 0}
 };
+
+extern bool disable_qtls;
+extern bool asbsm_mode;
 
 int main(int argc, char** argv)
 {
@@ -47,7 +55,7 @@ int main(int argc, char** argv)
     const char *cc = "reno";
     int iw = 10;
 
-    while ((ch = getopt_long(argc, argv, "c:egl:p:s:t:h", long_options, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "c:sp:B:egl:t:h", long_options, NULL)) != -1) {
         switch (ch) {
         case 0:
             if(strcmp(optarg, "reno") != 0 && strcmp(optarg, "cubic") != 0) {
@@ -63,8 +71,31 @@ int main(int argc, char** argv)
                 exit(1);
             }
             break;
+	    case 2:
+            if (strcmp(optarg, "enable") == 0)
+                disable_qtls = false;
+            else if (strcmp(optarg, "disable") == 0)
+                disable_qtls = true;
+            else {
+                fprintf(stderr, "invalid argument passed to --qtls\n");
+                exit(1);
+            }
+            break;
+        case 3:
+            if (strcmp(optarg, "qperf") == 0)
+                asbsm_mode = false;
+            else if (strcmp(optarg, "asbsm") == 0)
+                asbsm_mode = true;
+            else {
+                fprintf(stderr, "invalid argument passed to --opmode\n");
+                exit(1);
+            }
+            break;
         case 'c':
             host = optarg;
+            break;
+        case 'B':
+            address = optarg;
             break;
         case 'e':
             ttfb_only = true;
@@ -88,7 +119,6 @@ int main(int argc, char** argv)
             }
             break;
         case 's':
-            address = optarg;
             server_mode = true;
             break;
         case 't':
@@ -118,5 +148,5 @@ int main(int argc, char** argv)
     sprintf(port_char, "%d", port);
     return server_mode ?
                 run_server(address, port_char, gso, logfile, cc, iw, "server.crt", "server.key") :
-                run_client(port_char, gso, logfile, cc, iw, host, runtime_s, ttfb_only);
+                run_client(address, port_char, gso, logfile, cc, iw, host, runtime_s, ttfb_only);
 }

@@ -186,7 +186,10 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
     server_ctx.transport_params.max_stream_data.uni = UINT32_MAX;
     server_ctx.transport_params.max_stream_data.bidi_local = UINT32_MAX;
     server_ctx.transport_params.max_stream_data.bidi_remote = UINT32_MAX;
+    server_ctx.transport_params.max_data = UINT32_MAX;
     server_ctx.initcwnd_packets = iw;
+    server_ctx.use_pacing = 1;
+    server_ctx.ack_frequency = 0;
 
     if(strcmp(cc, "reno") == 0) {
         server_ctx.init_cc = &quicly_cc_reno_init;
@@ -203,6 +206,9 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
 
     struct ev_loop *loop = EV_DEFAULT;
 
+    if (!address)
+        address = "0.0.0.0";
+
     struct addrinfo *addr = get_address(address, port);
     if (addr == NULL) {
         printf("failed get addrinfo for port %s\n", port);
@@ -213,7 +219,7 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
     freeaddrinfo(addr);
     
     if (server_socket == -1) {
-        printf("failed to listen on port %s\n", port);
+        printf("failed to listen on port %s:%s\n", address, port);
         return 1;
     }
 

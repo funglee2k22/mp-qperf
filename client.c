@@ -115,13 +115,16 @@ static void client_on_conn_close(quicly_closed_by_remote_t *self, quicly_conn_t 
     } else {
         fprintf(stderr, "unexpected close:code=%li\n", err);
     }
+
+    printf("Exit client on conn close\n");
+    exit(0);
 }
 
 static quicly_stream_open_t stream_open = {&client_on_stream_open};
 
 static quicly_closed_by_remote_t closed_by_remote = {&client_on_conn_close};
 
-int run_client(const char *port, bool gso, const char *logfile, const char *cc, int iw, const char *host, int runtime_s, bool ttfb_only)
+int run_client(const char* address, const char *port, bool gso, const char *logfile, const char *cc, int iw, const char *host, int runtime_s, bool ttfb_only)
 {
     setup_session_cache(get_tlsctx());
     quicly_amend_ptls_context(get_tlsctx());
@@ -133,7 +136,10 @@ int run_client(const char *port, bool gso, const char *logfile, const char *cc, 
     client_ctx.transport_params.max_stream_data.uni = UINT32_MAX;
     client_ctx.transport_params.max_stream_data.bidi_local = UINT32_MAX;
     client_ctx.transport_params.max_stream_data.bidi_remote = UINT32_MAX;
+    client_ctx.transport_params.max_data = UINT32_MAX;
     client_ctx.initcwnd_packets = iw;
+    client_ctx.use_pacing = 1;
+    client_ctx.ack_frequency = 0;
 
     if(strcmp(cc, "reno") == 0) {
         client_ctx.init_cc = &quicly_cc_reno_init;
@@ -166,6 +172,10 @@ int run_client(const char *port, bool gso, const char *logfile, const char *cc, 
         memset(&local, 0, sizeof(local));
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = INADDR_ANY;
+        if (address && (inet_pton(AF_INET, address, &local.sin_addr.s_addr) != 1)) {
+            fprintf(stderr, "Failed to convert %s to IPv4 address\n", address);
+            return 1;
+        }
         local.sin_port = 0; // Let the OS choose the port
         if (bind(client_socket, (struct sockaddr *)&local, sizeof(local)) != 0) {
             perror("bind(2) failed");
@@ -176,6 +186,8 @@ int run_client(const char *port, bool gso, const char *logfile, const char *cc, 
         memset(&local, 0, sizeof(local));
         local.sin6_family = AF_INET6;
         local.sin6_addr = in6addr_any;
+        if (address && (inet_pton(AF_INET6, address, &local.sin6_addr) != 1))
+            fprintf(stderr, "Failed to convert %s to IPv6 address\n", address);
         local.sin6_port = 0; // Let the OS choose the port
         if (bind(client_socket, (struct sockaddr *)&local, sizeof(local)) != 0) {
             perror("bind(2) failed");
@@ -185,6 +197,25 @@ int run_client(const char *port, bool gso, const char *logfile, const char *cc, 
         fprintf(stderr, "Unknown address family\n");
         return 1;
     }
+
+    int retval=0, buflen=0, len=sizeof(buflen);
+
+    if ((retval = getsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
+        perror("getsockopt failed");
+        return 1;
+    }
+    printf("Old Client UDP RCV_BUF = %d\n", buflen);
+
+    buflen = 500000; //note that Linux allocate 2x given buffer length
+    if ((retval = setsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, len)) != 0) {
+        perror("setsockopt failed");
+        return 1;
+    }
+    if ((retval = getsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
+        perror("getsockopt failed");
+        return 1;
+    }
+    printf("New Client UDP RCV_BUF = %d\n", buflen);
 
     if (logfile)
     {
@@ -232,13 +263,15 @@ void quit_client()
         return;
     }
 
-    quicly_close(conn, 0, "");
+    quicly_close(conn, 0, "client app initated conn close");
     if(!send_pending(&client_ctx, client_socket, conn)) {
         printf("send_pending failed during connection close");
         quicly_free(conn);
         exit(0);
     }
-    client_refresh_timeout();
+    quicly_free(conn);
+    exit(0);
+    //client_refresh_timeout();
 }
 
 void on_first_byte()
