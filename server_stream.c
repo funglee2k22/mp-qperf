@@ -20,7 +20,7 @@ typedef struct
     uint32_t srtt;
     uint32_t cwnd_exiting_slow_start;
     uint64_t gooput_max_kbps;
-    double   search_undelv_rate_max;
+    double   search_undelv_rate_ewa;
     ev_timer report_timer;
 } server_stream;
 
@@ -39,9 +39,9 @@ static void print_report(server_stream *s)
     s->srtt = stats.rtt.smoothed;
     s->cwnd_exiting_slow_start = stats.cc.cwnd_exiting_slow_start;
     s->gooput_max_kbps = stats.cc.gput_max;
-    s->search_undelv_rate_max = stats.cc.undelv_rate_max;
+    s->search_undelv_rate_ewa = stats.cc.undelv_rate_ewa;
     printf("connection %i second %i ss gput mbps: %.2f ss subr: %.3f send wnd: %"PRIu32" srtt ms: %d pkts sent: %"PRIu64" pkts lost: %"PRIu64"\n",
-           s->report_id, s->report_second, s->gooput_max_kbps/1000., s->search_undelv_rate_max, stats.cc.cwnd, s->srtt,
+           s->report_id, s->report_second, s->gooput_max_kbps/1000., s->search_undelv_rate_ewa, stats.cc.cwnd, s->srtt,
            s->report_num_packets_sent, s->report_num_packets_lost);
     fflush(stdout);
     ++s->report_second;
