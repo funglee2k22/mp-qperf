@@ -12,10 +12,16 @@
 #include <stdbool.h>
 #include <float.h>
 #include <quicly/streambuf.h>
+#include <arpa/inet.h>
 
 #include <picotls/../../t/util.h>
 
-static int client_socket = -1;
+static int second_path_created = 0;
+static int num_clients = 2;
+static int client_sd[2] = {-1, -1};
+struct sockaddr_storage client_sas[2];
+struct sockaddr_storage server_sas;
+socklen_t server_salen;
 static quicly_conn_t *conn = NULL;
 static ev_timer client_timeout;
 static quicly_context_t client_ctx;
@@ -37,12 +43,20 @@ void client_refresh_timeout()
 
 void client_timeout_cb(EV_P_ ev_timer *w, int revents)
 {
-    if(!send_pending(&client_ctx, client_socket, conn)) {
+    if(!send_pending(&client_ctx, conn, client_sd, client_sas, num_clients)) {
         quicly_free(conn);
         exit(0);
     }
 
     client_refresh_timeout();
+}
+
+int find_client_socket_index(int fd)
+{
+    for (int i=0; i<2; i++)
+        if (client_sd[i] == fd)
+            return i;
+    return -1;
 }
 
 void client_read_cb(EV_P_ ev_io *w, int revents)
@@ -53,6 +67,13 @@ void client_read_cb(EV_P_ ev_io *w, int revents)
     socklen_t salen = sizeof(sa);
     quicly_decoded_packet_t packet;
     ssize_t bytes_received;
+    int index;
+
+    // find client socket index
+    if ((index = find_client_socket_index(w->fd)) < 0) {
+        fprintf(stderr, "cannot find socket_address_storeage for sd=%i\n", w->fd);
+        return;
+    }
 
     while((bytes_received = recvfrom(w->fd, buf, sizeof(buf), MSG_DONTWAIT,(struct sockaddr *) &sa, &salen)) != -1) {
         for(size_t offset = 0; offset < bytes_received; ) {
@@ -62,7 +83,7 @@ void client_read_cb(EV_P_ ev_io *w, int revents)
             }
 
             // handle packet --------------------------------------------------
-            int ret = quicly_receive(conn, NULL, (struct sockaddr *) &sa, &packet);
+            int ret = quicly_receive(conn, (struct sockaddr *)&client_sas[index], (struct sockaddr *) &sa, &packet);
             if(ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED) {
                 fprintf(stderr, "quicly_receive returned %i\n", ret);
                 exit(1);
@@ -81,7 +102,14 @@ void client_read_cb(EV_P_ ev_io *w, int revents)
         perror("recvfrom failed");
     }
 
-    if(!send_pending(&client_ctx, client_socket, conn)) {
+    if (!second_path_created) {
+        // Add sencond path
+        int ret = quicly_add_path(conn, (struct sockaddr *)&client_sas[1]);
+        assert(ret == 0);
+        second_path_created = 1;
+    }
+
+    if(!send_pending(&client_ctx, conn, client_sd, client_sas, num_clients)) {
         quicly_free(conn);
         exit(0);
     }
@@ -113,7 +141,7 @@ static void client_on_conn_close(quicly_closed_by_remote_t *self, quicly_conn_t 
     } else if (err == QUICLY_ERROR_RECEIVED_STATELESS_RESET) {
         fprintf(stderr, "stateless reset\n");
     } else {
-        fprintf(stderr, "unexpected close:code=%li\n", err);
+        fprintf(stderr, "unexpected close:code=%i\n", err);
     }
 
     printf("Exit client on conn close\n");
@@ -123,6 +151,68 @@ static void client_on_conn_close(quicly_closed_by_remote_t *self, quicly_conn_t 
 static quicly_stream_open_t stream_open = {&client_on_stream_open};
 
 static quicly_closed_by_remote_t closed_by_remote = {&client_on_conn_close};
+
+int bind_client_socket(int sd, struct sockaddr *server_sa, const char* address, struct sockaddr_storage *sas)
+{
+    struct sockaddr *client_sa = (struct sockaddr *)sas;
+    if (server_sa->sa_family == AF_INET) {
+        struct sockaddr_in *local = (struct sockaddr_in *)client_sa;
+        memset(local, 0, sizeof(*local));
+        local->sin_family = AF_INET;
+        local->sin_addr.s_addr = INADDR_ANY;
+        if (address && (inet_pton(AF_INET, address, &local->sin_addr.s_addr) != 1)) {
+            fprintf(stderr, "Failed to convert %s to IPv4 address\n", address);
+            return 1;
+        }
+        local->sin_port = 0; // Let the OS choose the port
+        if (bind(sd, (struct sockaddr *)local, sizeof(*local)) != 0) {
+            perror("bind(2) failed");
+            return 1;
+        }
+        struct sockaddr_in sin;
+        socklen_t len = sizeof(sin);
+        if (getsockname(sd, (struct sockaddr *)&sin, &len) == -1) {
+            perror("getsockname");
+            return 1;
+        }
+        local->sin_port = sin.sin_port;
+    } else if (server_sa->sa_family == AF_INET6) {
+        struct sockaddr_in6 *local = (struct sockaddr_in6 *)&sas;
+        memset(local, 0, sizeof(*local));
+        local->sin6_family = AF_INET6;
+        local->sin6_addr = in6addr_any;
+        if (address && (inet_pton(AF_INET6, address, &local->sin6_addr) != 1))
+            fprintf(stderr, "Failed to convert %s to IPv6 address\n", address);
+        local->sin6_port = 0; // Let the OS choose the port
+        if (bind(sd, (struct sockaddr *)local, sizeof(*local)) != 0) {
+            perror("bind(2) failed");
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "Unknown address family\n");
+        return 1;
+    }
+
+    int retval=0, buflen=0, len=sizeof(buflen);
+    if ((retval = getsockopt(sd, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
+        perror("getsockopt failed");
+        return 1;
+    }
+    printf("Client sd=%d: Old UDP RCV_BUF = %d\n", sd, buflen);
+
+    buflen = 500000; //note that Linux allocate 2x given buffer length
+    if ((retval = setsockopt(sd, SOL_SOCKET, SO_RCVBUF, &buflen, len)) != 0) {
+        perror("setsockopt failed");
+        return 1;
+    }
+    if ((retval = getsockopt(sd, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
+        perror("getsockopt failed");
+        return 1;
+    }
+    printf("Client sd=%d: New UDP RCV_BUF = %d\n", sd, buflen);
+
+    return 0;
+}
 
 int run_client(const char* address, const char *port, bool gso, const char *logfile, const char *cc, int iw, const char *host, int runtime_s, bool ttfb_only)
 {
@@ -137,8 +227,8 @@ int run_client(const char* address, const char *port, bool gso, const char *logf
     client_ctx.transport_params.max_stream_data.bidi_local = UINT32_MAX;
     client_ctx.transport_params.max_stream_data.bidi_remote = UINT32_MAX;
     client_ctx.transport_params.max_data = UINT32_MAX;
+    client_ctx.transport_params.enable_multipath = 1;
     client_ctx.initcwnd_packets = iw;
-    client_ctx.use_pacing = 1;
     client_ctx.ack_frequency = 0;
 
     if(strcmp(cc, "reno") == 0) {
@@ -151,71 +241,29 @@ int run_client(const char* address, const char *port, bool gso, const char *logf
         enable_gso();
     }
 
-    struct ev_loop *loop = EV_DEFAULT;
+    uint8_t *cid_key = "God";
+    client_ctx.cid_encryptor = quicly_new_default_cid_encryptor(&ptls_openssl_aes128ecb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+                                                                ptls_iovec_init(cid_key, strlen(cid_key)));
+    assert(client_ctx.cid_encryptor != NULL);
 
-    struct sockaddr_storage sas;
-    socklen_t salen;
-    if (resolve_address((void *)&sas, &salen, host, port, AF_UNSPEC, SOCK_DGRAM, IPPROTO_UDP) != 0) {
+    struct ev_loop *loop = EV_DEFAULT;
+    printf("HOST: %s\n", host); 
+    if (resolve_address((void *)&server_sas, &server_salen, host, port, AF_UNSPEC, SOCK_DGRAM, IPPROTO_UDP) != 0) {
         exit(-1);
     }
-    
-    struct sockaddr *sa = (struct sockaddr *)&sas;
-    
-    client_socket = socket(sa->sa_family, SOCK_DGRAM, IPPROTO_UDP);
-    if (client_socket == -1) {
-        perror("socket(2) failed");
-        return 1;
-    }
-    
-    if (sa->sa_family == AF_INET) {
-        struct sockaddr_in local;
-        memset(&local, 0, sizeof(local));
-        local.sin_family = AF_INET;
-        local.sin_addr.s_addr = INADDR_ANY;
-        if (address && (inet_pton(AF_INET, address, &local.sin_addr.s_addr) != 1)) {
-            fprintf(stderr, "Failed to convert %s to IPv4 address\n", address);
+    struct sockaddr *server_sa = (struct sockaddr *)&server_sas;
+    const char *client_addr[2] = {address, "192.168.3.1"};
+    for (int i=0; i<num_clients; i++) {
+        client_sd[i] = socket(server_sa->sa_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (client_sd[i] == -1) {
+            perror("socket(2) failed");
             return 1;
         }
-        local.sin_port = 0; // Let the OS choose the port
-        if (bind(client_socket, (struct sockaddr *)&local, sizeof(local)) != 0) {
-            perror("bind(2) failed");
+        if (bind_client_socket(client_sd[i], server_sa, client_addr[i], &client_sas[i]) != 0) {
+            printf("Client sd=%d: bind to local address failed", client_sd[i]);
             return 1;
-        }
-    } else if (sa->sa_family == AF_INET6) {
-        struct sockaddr_in6 local;
-        memset(&local, 0, sizeof(local));
-        local.sin6_family = AF_INET6;
-        local.sin6_addr = in6addr_any;
-        if (address && (inet_pton(AF_INET6, address, &local.sin6_addr) != 1))
-            fprintf(stderr, "Failed to convert %s to IPv6 address\n", address);
-        local.sin6_port = 0; // Let the OS choose the port
-        if (bind(client_socket, (struct sockaddr *)&local, sizeof(local)) != 0) {
-            perror("bind(2) failed");
-            return 1;
-        }
-    } else {
-        fprintf(stderr, "Unknown address family\n");
-        return 1;
+        };
     }
-
-    int retval=0, buflen=0, len=sizeof(buflen);
-
-    if ((retval = getsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
-        perror("getsockopt failed");
-        return 1;
-    }
-    printf("Old Client UDP RCV_BUF = %d\n", buflen);
-
-    buflen = 500000; //note that Linux allocate 2x given buffer length
-    if ((retval = setsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, len)) != 0) {
-        perror("setsockopt failed");
-        return 1;
-    }
-    if ((retval = getsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &buflen, &len)) != 0) {
-        perror("getsockopt failed");
-        return 1;
-    }
-    printf("New Client UDP RCV_BUF = %d\n", buflen);
 
     if (logfile)
     {
@@ -228,13 +276,16 @@ int run_client(const char* address, const char *port, bool gso, const char *logf
     // start time
     start_time = client_ctx.now->cb(client_ctx.now);
 
-    int ret = quicly_connect(&conn, &client_ctx, host, sa, NULL, &next_cid, resumption_token, NULL, NULL, NULL);
+    // Create logical connection and first path
+    struct sockaddr *client_sa = (struct sockaddr *)&client_sas[0];
+    int ret = quicly_connect(&conn, &client_ctx, host, server_sa, client_sa, &next_cid, resumption_token, NULL, NULL, NULL);
     assert(ret == 0);
     ++next_cid.master_id;
 
     enqueue_request(conn);
-    if(!send_pending(&client_ctx, client_socket, conn)) {
-        printf("failed to connect: send_pending failed\n");
+    if(!send_pending(&client_ctx, conn, client_sd, client_sas, 1)) {
+
+        printf("failed to connect on sd=%d: send_pending failed\n", client_sd[0]);
         exit(1);
     }
 
@@ -243,9 +294,11 @@ int run_client(const char* address, const char *port, bool gso, const char *logf
         exit(1);
     }
 
-    ev_io socket_watcher;
-    ev_io_init(&socket_watcher, &client_read_cb, client_socket, EV_READ);
-    ev_io_start(loop, &socket_watcher);
+    ev_io socket_watcher[2];
+    for (int i=0; i<2; i++) {
+        ev_io_init(&socket_watcher[i], &client_read_cb, client_sd[i], EV_READ);
+        ev_io_start(loop, &socket_watcher[i]);
+    }
 
     ev_init(&client_timeout, &client_timeout_cb);
     client_refresh_timeout();
@@ -264,7 +317,7 @@ void quit_client()
     }
 
     quicly_close(conn, 0, "client app initated conn close");
-    if(!send_pending(&client_ctx, client_socket, conn)) {
+    if(!send_pending(&client_ctx, conn, client_sd, client_sas, num_clients)) {
         printf("send_pending failed during connection close");
         quicly_free(conn);
         exit(0);

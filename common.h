@@ -10,7 +10,7 @@ ptls_context_t *get_tlsctx();
 
 struct addrinfo *get_address(const char *host, const char *port);
 void enable_gso();
-bool send_pending(quicly_context_t *ctx, int fd, quicly_conn_t *conn);
+bool send_pending(quicly_context_t *ctx, quicly_conn_t *conn, int *fd, struct sockaddr_storage *sas, int num_sas);
 void print_escaped(const char *src, size_t len);
 
 

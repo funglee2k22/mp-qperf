@@ -9,16 +9,25 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <arpa/inet.h>
 
 #include <quicly/streambuf.h>
 
 #include <picotls/openssl.h>
 #include <picotls/../../t/util.h>
 
-static quicly_conn_t **conns;
+typedef struct st_logical_conn {
+    quicly_conn_t *conn;
+    int num_clients;
+    struct sockaddr_storage client_sas[2];
+} logical_conn_t;
+
+//static quicly_conn_t **conns;
+static logical_conn_t *conns;
 static int server_socket = -1;
 static quicly_context_t server_ctx;
-static int server_socket;
+struct sockaddr_storage local_sas;
+socklen_t local_sas_len;
 static size_t num_conns = 0;
 static ev_timer server_timeout;
 static quicly_cid_plaintext_t next_cid;
@@ -52,28 +61,30 @@ static int udp_listen(struct addrinfo *addr)
 static inline quicly_conn_t *find_conn(struct sockaddr_storage *sa, socklen_t salen, quicly_decoded_packet_t *packet)
 {
     for(size_t i = 0; i < num_conns; ++i) {
-        if(quicly_is_destination(conns[i], NULL, (struct sockaddr *) sa, packet)) {
-            return conns[i];
+        if(quicly_is_destination(conns[i].conn, (struct sockaddr *) &local_sas, (struct sockaddr *) sa, packet)) {
+            return conns[i].conn;
         }
     }
     return NULL;
 }
 
-static void append_conn(quicly_conn_t *conn)
+static void append_conn(quicly_conn_t *conn, struct sockaddr_storage *sa, socklen_t salen)
 {
     ++num_conns;
-    conns = realloc(conns, sizeof(quicly_conn_t*) * num_conns);
+    conns = realloc(conns, sizeof(logical_conn_t) * num_conns);
     assert(conns != NULL);
-    conns[num_conns - 1] = conn;
+    conns[num_conns - 1].conn = conn;
+    conns[num_conns - 1].num_clients = 1;
+    memcpy(&conns[num_conns - 1].client_sas[0], sa, salen);
 
     *quicly_get_data(conn) = calloc(1, sizeof(int64_t));
 }
 
 static size_t remove_conn(size_t i)
 {
-    free(*quicly_get_data(conns[i]));
-    quicly_free(conns[i]);
-    memmove(conns + i, conns + i + 1, (num_conns - i - 1) * sizeof(quicly_conn_t*));
+    free(*quicly_get_data(conns[i].conn));
+    quicly_free(conns[i].conn);
+    memmove(conns + i, conns + i + 1, (num_conns - i - 1) * sizeof(logical_conn_t));
     --num_conns;
 
     if (i > 0) {
@@ -88,10 +99,10 @@ void server_send_pending()
 {
     int64_t next_timeout = INT64_MAX;
     for(size_t i = 0; i < num_conns; ++i) {
-        if(!send_pending(&server_ctx, server_socket, conns[i])) {
+        if(!send_pending(&server_ctx, conns[i].conn, &server_socket, &local_sas, 1)) {
             i = remove_conn(i);
         } else {
-            next_timeout = min_int64(quicly_get_first_timeout(conns[i]), next_timeout);
+            next_timeout = min_int64(quicly_get_first_timeout(conns[i].conn), next_timeout);
         }
     }
 
@@ -111,17 +122,17 @@ static inline void server_handle_packet(quicly_decoded_packet_t *packet, struct 
     quicly_conn_t *conn = find_conn(sa, salen, packet);
     if(conn == NULL) {
         // new conn
-        int ret = quicly_accept(&conn, &server_ctx, 0, (struct sockaddr *) sa, packet, NULL, &next_cid, NULL, NULL);
+        int ret = quicly_accept(&conn, &server_ctx, (struct sockaddr *)&local_sas, (struct sockaddr *) sa, packet, NULL, &next_cid, NULL, NULL);
         if(ret != 0) {
             printf("quicly_accept failed with code %i\n", ret);
             return;
         }
         ++next_cid.master_id;
         printf("got new connection\n");
-        append_conn(conn);
+        append_conn(conn, sa, salen);
 
     } else {
-        int ret = quicly_receive(conn, NULL, (struct sockaddr *) sa, packet);
+        int ret = quicly_receive(conn, (struct sockaddr *) &local_sas, (struct sockaddr *) sa, packet);
         if(ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED) {
             fprintf(stderr, "quicly_receive returned %i\n", ret);
             exit(1);
@@ -159,15 +170,15 @@ static void server_on_conn_close(quicly_closed_by_remote_t *self, quicly_conn_t 
                                  uint64_t frame_type, const char *reason, size_t reason_len)
 {
     if (QUICLY_ERROR_IS_QUIC_TRANSPORT(err)) {
-        fprintf(stderr, "transport close:code=0x%lx;frame=%" PRIu64 ";reason=%.*s\n", QUICLY_ERROR_GET_ERROR_CODE(err),
+        fprintf(stderr, "transport close:code=0x%x;frame=%" PRIu64 ";reason=%.*s\n", QUICLY_ERROR_GET_ERROR_CODE(err),
                 frame_type, (int)reason_len, reason);
     } else if (QUICLY_ERROR_IS_QUIC_APPLICATION(err)) {
-        fprintf(stderr, "application close:code=0x%lx;reason=%.*s\n", QUICLY_ERROR_GET_ERROR_CODE(err), (int)reason_len,
+        fprintf(stderr, "application close:code=0x%x;reason=%.*s\n", QUICLY_ERROR_GET_ERROR_CODE(err), (int)reason_len,
                 reason);
     } else if (err == QUICLY_ERROR_RECEIVED_STATELESS_RESET) {
         fprintf(stderr, "stateless reset\n");
     } else {
-        fprintf(stderr, "unexpected close:code=%ld\n", err);
+        fprintf(stderr, "unexpected close:code=%d\n", err);
     }
 }
 
@@ -186,9 +197,10 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
     server_ctx.transport_params.max_stream_data.uni = UINT32_MAX;
     server_ctx.transport_params.max_stream_data.bidi_local = UINT32_MAX;
     server_ctx.transport_params.max_stream_data.bidi_remote = UINT32_MAX;
+    server_ctx.transport_params.enable_multipath = 1;
     server_ctx.transport_params.max_data = UINT32_MAX;
     server_ctx.initcwnd_packets = iw;
-    server_ctx.use_pacing = 1;
+    //server_ctx.use_pacing = 1;
     server_ctx.ack_frequency = 0;
 
     if(strcmp(cc, "reno") == 0) {
@@ -204,6 +216,11 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
     load_certificate_chain(server_ctx.tls, cert);
     load_private_key(server_ctx.tls, key);
 
+    uint8_t *cid_key = "God";
+    server_ctx.cid_encryptor = quicly_new_default_cid_encryptor(&ptls_openssl_aes128ecb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+                                                                ptls_iovec_init(cid_key, strlen(cid_key)));
+    assert(server_ctx.cid_encryptor != NULL);
+
     struct ev_loop *loop = EV_DEFAULT;
 
     if (!address)
@@ -214,7 +231,15 @@ int run_server(const char* address, const char *port, bool gso, const char *logf
         printf("failed get addrinfo for port %s\n", port);
         return -1;
     }
-    
+    struct addrinfo *addr_next = addr;
+    while (addr_next) {
+        printf("UG: addr = %s:%d\n", inet_ntoa(((struct sockaddr_in *)addr_next->ai_addr)->sin_addr),
+            htons (((struct sockaddr_in *)addr_next->ai_addr)->sin_port));
+        addr_next = addr->ai_next;
+    }
+    memcpy(&local_sas, addr->ai_addr, addr->ai_addrlen);
+    local_sas_len = addr->ai_addrlen;
+
     server_socket = udp_listen(addr);
     freeaddrinfo(addr);
     

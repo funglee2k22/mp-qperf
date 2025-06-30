@@ -38,8 +38,8 @@ static struct option long_options[] =
     {NULL, 0, NULL, 0}
 };
 
-extern bool disable_qtls;
-extern bool asbsm_mode;
+bool disable_qtls;
+bool asbsm_mode;
 
 int main(int argc, char** argv)
 {

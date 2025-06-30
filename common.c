@@ -6,6 +6,8 @@
 #include <memory.h>
 #include <picotls/openssl.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 ptls_context_t *get_tlsctx()
 {
@@ -112,7 +114,15 @@ void enable_gso()
     send_dgrams = send_dgrams_gso;
 }
 
-bool send_pending(quicly_context_t *ctx, int fd, quicly_conn_t *conn)
+int find_matching_sas_index(struct sockaddr_in *local, struct sockaddr_storage *sas, int num_sas)
+{
+    for (int i=0; i<num_sas; i++)
+        if (memcmp(local, &sas[i], sizeof(*local)) == 0)
+            return i;
+    return -1;
+}
+
+bool send_pending(quicly_context_t *ctx, quicly_conn_t *conn, int *fd, struct sockaddr_storage *sas, int num_sas)
 {
     #define SEND_BATCH_SIZE 16
 
@@ -138,7 +148,11 @@ bool send_pending(quicly_context_t *ctx, int fd, quicly_conn_t *conn)
             return true;
         }
 
-        if (!send_dgrams(fd, &dest.sa, dgrams, num_dgrams)) {
+        int index = find_matching_sas_index((struct sockaddr_in*)&src, sas, num_sas);
+        if (index < 0)
+            return false;
+
+        if (!send_dgrams(fd[index], &dest.sa, dgrams, num_dgrams)) {
             return false;
         }
     };
